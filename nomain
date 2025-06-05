@@ -1,0 +1,209 @@
+// === Jenkinsfile (Scripted Pipeline) ===
+
+def userConfig
+def projectConfig
+def cliConfig
+def setNoti
+def stageName
+def stageBuild
+def stageAnaly
+def stageUtest
+def buildAgent = 'Server-PC'
+def sourceBuild = false
+
+node(buildAgent) {
+    try {
+        stage('Init') {
+            initPipeline()
+        }
+
+        stage('Get Config') {
+            loadConfigs()
+            validateBranchRules()
+            prepareWorkspace()
+        }
+
+        if (sourceBuild) {
+            if (stageBuild) {
+                stage('Build') {
+                    runBuild(cliConfig.build, stageBuild)
+                }
+            }
+
+            if (stageAnaly) {
+                stage('Static Analysis') {
+                    runStaticAnalysis(cliConfig.analysis, stageAnaly)
+                }
+
+                if (stageAnaly == 'cppcheck') {
+                    stage('Generate Cppcheck Report') {
+                        runCppcheckReport()
+                    }
+                }
+            }
+
+            if (stageUtest) {
+                stage('Unit Test') {
+                    runUnitTest(cliConfig.test, stageUtest)
+                }
+
+                stage('Coverage Result') {
+                    checkCoverage("coverage_${stageUtest}.yaml")
+                }
+
+                stage('Testlog Result') {
+                    checkTestLog("testlog_${stageUtest}.yaml")
+                }
+            }
+        }
+
+        if (env.CHANGE_ID) {
+            stage('Merge pull request') {
+                mergePullRequest()
+            }
+        }
+
+        stage('Result URL') {
+            generateResultZip()
+        }
+
+    } catch (err) {
+        currentBuild.result = 'FAILURE'
+        throw err
+    } finally {
+        notifyResult()
+    }
+}
+
+// === Function Definitions ===
+
+def initPipeline() {
+    cleanWs()
+    checkout scm
+    userConfig = readYaml file: "${env.WORKSPACE}\\jenkins\\user_config\\ci-config.yaml"
+    projectConfig = readYaml file: "${env.WORKSPACE}\\jenkins\\project_config\\project_config.yaml"
+    cliConfig = readYaml file: "${env.WORKSPACE}\\jenkins\\project_config\\runcommand.yaml"
+
+    buildAgent = userConfig.buildAgent ?: buildAgent
+    if (!projectConfig.agentList.contains(buildAgent)) {
+        error "Invalid build agent: ${buildAgent}"
+    }
+}
+
+def loadConfigs() {
+    stageBuild = userConfig.buildSouce?.name
+    stageAnaly = userConfig.analysis?.name
+    stageUtest = userConfig.unitTest?.name
+    def notiKey = userConfig.noti
+    setNoti = projectConfig[notiKey] ?: error("Notification channel '${notiKey}' not found.")
+}
+
+def validateBranchRules() {
+    def mainOnly = userConfig.onlymain
+    if ((mainOnly == 'on' || mainOnly == true) && env.BRANCH_NAME != 'main') {
+        error("Build only allowed on main branch.")
+    }
+
+    def isPR = env.CHANGE_ID != null
+    def isCommit = !isPR
+    def buildRules = userConfig.buildRules ?: [userConfig.build]
+    if ((isPR && buildRules.contains('pr')) || (isCommit && buildRules.contains('commit'))) {
+        sourceBuild = true
+    } else {
+        error("Build rule does not allow this run.")
+    }
+}
+
+def prepareWorkspace() {
+    bat "if not exist result mkdir result"
+    bat "xcopy jenkins\\project_config\\runcommand\\* .\\ /s /y"
+}
+
+def runBuild(targetList, targetName) {
+    def target = targetList.find { it.name == targetName }
+    if (!target) error "Build target '${targetName}' not found"
+    bat target.run
+}
+
+def runStaticAnalysis(targetList, targetName) {
+    def target = targetList.find { it.name == targetName }
+    if (!target) error "Static analysis target '${targetName}' not found"
+    bat target.run
+}
+
+def runCppcheckReport() {
+    bat """
+        "py" "C:\\Program Files\\Cppcheck\\cppcheck-htmlreport" --file=cppcheck-report.xml --report-dir=cppcheck-report --source-dir=.
+    """
+    recordIssues tools: [[ $class: 'CppCheck', pattern: 'cppcheck-report.xml' ]]
+    publishHTML([reportDir: "cppcheck-report", reportFiles: 'index.html', reportName: 'Cppcheck Report'])
+}
+
+def runUnitTest(targetList, targetName) {
+    def target = targetList.find { it.name == targetName }
+    if (!target) error "Unit test target '${targetName}' not found"
+    bat target.run
+}
+
+def checkCoverage(filePath) {
+    if (!fileExists(filePath)) return
+    def cov = readYaml file: filePath
+    if (cov.coverage != 100.0) {
+        error "Coverage is not 100%! Got ${cov.coverage}"
+    }
+}
+
+def checkTestLog(filePath) {
+    if (!fileExists(filePath)) return
+    def result = readYaml file: filePath
+    if (result.tests) {
+        error "Test failed: ${result.num}, ${result.tests}"
+    }
+}
+
+def mergePullRequest() {
+    def prId = env.CHANGE_ID
+    def gitUrl = env.GIT_URL
+    def firstPart = gitUrl.replaceAll('(/repo/.*)', '/')
+    def secondPart = gitUrl.replaceAll('.*?repo/', '')
+    def credId = projectConfig.credentialsId
+
+    withCredentials([usernamePassword(credentialsId: credId, usernameVariable: 'SCM_USER', passwordVariable: 'SCM_PASS')]) {
+        bat """
+            curl -s -u %SCM_USER%:%SCM_PASS% ^
+            -H "accept: */*" ^
+            -H "Content-Type: application/vnd.scmm-mergeCommand+json;v=2" ^
+            -d "{\\"commitMessage\\": \\"Merge by Jenkins\\", \\"shouldDeleteSourceBranch\\": false}" ^
+            ${firstPart}api/v2/merge/${secondPart}/${prId}?strategy=MERGE_COMMIT
+        """
+    }
+}
+
+def generateResultZip() {
+    def timestamp = new Date().format('yyyyMMdd-HHmm')
+    def zipName = "CI_${env.BRANCH_NAME}-${timestamp}.zip"
+    bat "powershell Compress-Archive -Path result\\ ${zipName} -Update"
+    echo "Result URL: ${env.JOB_URL}lastSuccessfulBuild/artifact/${zipName}"
+    archiveArtifacts zipName
+}
+
+def notifyResult() {
+    def status = currentBuild.result ?: 'SUCCESS'
+    def color = status == 'SUCCESS' ? '00FF00' : 'FF0000'
+    def title = status == 'SUCCESS' ? 'Build Succeeded' : "Build Failed at stage: ${stageName}"
+
+    writeFile file: 'payload.json', text: """{
+      "@type": "MessageCard",
+      "@context": "http://schema.org/extensions",
+      "summary": "${title}",
+      "themeColor": "${color}",
+      "title": "${title}: ${env.JOB_NAME}",
+      "text": "**Build number: ${env.BUILD_NUMBER}** <br>**URL: [${env.BUILD_URL}](${env.BUILD_URL})**"
+    }"""
+
+    bat """
+        curl -H "Content-Type: application/json" -d @payload.json "${setNoti}"
+    """
+
+    bat "if exist payload.json del payload.json"
+}
