@@ -1,0 +1,252 @@
+// === Jenkinsfile (Scripted Pipeline) ===
+
+// Declare global variables
+String setNoti = ''
+String stageName = ''
+String stageBuild = ''
+String stageAnaly = ''
+String stageUtest = ''
+String buildAgent = 'Server-PC'
+boolean sourceBuild = false
+
+def userConfig
+
+def projectConfig
+
+def cliConfig
+
+// Initial node to set up pipeline
+node(buildAgent) {
+    echo "${buildAgent}"
+    stageName = 'Init'
+    stage(stageName) {
+        initPipeline()
+    }
+}
+
+// Main pipeline execution
+node(buildAgent) {
+    try {
+        echo "${buildAgent}"
+        stageName = 'Get Config'
+        stage(stageName) {
+            loadConfigs()
+            validateBranchRules()
+            prepareWorkspace()
+        }
+
+        if (sourceBuild) {
+            if (stageBuild) {
+                stageName = 'Build'
+                stage(stageName) {
+                    runBuild(cliConfig.build, stageBuild)
+                }
+            }
+
+            if (stageAnaly) {
+                stageName = 'Static Analysis'
+                stage(stageName) {
+                    runStaticAnalysis(cliConfig.analysis, stageAnaly)
+                }
+
+                if (stageAnaly == 'cppcheck') {
+                    stageName = 'Generate Cppcheck Report'
+                    stage(stageName) {
+                        runCppcheckReport()
+                    }
+                }
+            }
+
+            if (stageUtest) {
+                stageName = 'Unit Test'
+                stage(stageName) {
+                    runUnitTest(cliConfig.test, stageUtest)
+                }
+                stageName = 'Coverage Result'
+                stage(stageName) {
+                    checkCoverage("coverage_${stageUtest}.yaml")
+                }
+                stageName = 'Testlog Result'
+                stage(stageName) {
+                    checkTestLog("testlog_${stageUtest}.yaml")
+                }
+            }
+        }
+
+        if (env.CHANGE_ID) {
+            stageName = 'Merge pull request'
+            stage(stageName) {
+                mergePullRequest()
+            }
+        }
+
+        stage('Result URL') {
+            generateResultZip()
+        }
+
+    } catch (err) {
+        currentBuild.result = 'FAILURE'
+        echo "Error at stage : ${stageName}"
+        throw err
+    } finally {
+        notifyResult()
+    }
+}
+
+// === Function Definitions ===
+
+// Initialize the pipeline by cleaning workspace and loading YAML config files
+void initPipeline() {
+    cleanWs()
+    checkout scm
+    if (!env.GIT_URL) {
+        env.GIT_URL = scm.userRemoteConfigs[0].url
+    }
+    userConfig = readYaml file: "${env.WORKSPACE}\\jenkins\\user_config\\ci-config.yaml"
+    projectConfig = readYaml file: "${env.WORKSPACE}\\jenkins\\project_config\\project_config.yaml"
+    cliConfig = readYaml file: "${env.WORKSPACE}\\jenkins\\project_config\\runcommand.yaml"
+
+    buildAgent = userConfig.buildAgent ?: buildAgent
+    echo "buildAgent : ${buildAgent}"
+    echo "projectConfig.agentList : ${projectConfig.agentList}"
+    if (!projectConfig.agentList.contains(buildAgent)) {
+        error "Invalid build agent: ${buildAgent}"
+    }
+}
+
+// Load build, analysis, and test configuration from YAML
+void loadConfigs() {
+    stageBuild = userConfig.buildSouce?.name
+    echo "stageBuild : ${stageBuild}"
+    stageAnaly = userConfig.analysis?.name
+    echo "stageAnaly : ${stageAnaly}"
+    stageUtest = userConfig.unitTest?.name
+    echo "stageUtest : ${stageUtest}"
+    def notiKey = userConfig.noti
+    setNoti = projectConfig[notiKey] ?: error("Notification channel '${notiKey}' not found.")
+    echo "setNoti : ${setNoti}"
+}
+
+// Check branch rules and determine if the source should be built
+void validateBranchRules() {
+    def mainOnly = userConfig.onlymain
+    if ((mainOnly == 'on' || mainOnly == true) && env.BRANCH_NAME != 'main') {
+        error("Build only allowed on main branch.")
+    }
+
+    def isPR = env.CHANGE_ID != null
+    def isCommit = !isPR
+    def buildRules = userConfig.buildRules ?: [userConfig.build]
+    if ((isPR && buildRules.contains('pr')) || (isCommit && buildRules.contains('commit'))) {
+        sourceBuild = true
+    } else {
+        error("Build rule does not allow this run.")
+    }
+    echo "sourceBuild = ${sourceBuild}"
+}
+
+// Prepare the workspace by creating folders and copying necessary scripts
+void prepareWorkspace() {
+    bat """
+        if not exist ${env.WORKSPACE}\\result mkdir ${env.WORKSPACE}\\result
+        xcopy ${env.WORKSPACE}\\jenkins\\project_config\\runcommand\\* ${env.WORKSPACE}\\ /s /y
+    """
+}
+
+// Run the build command specified in config
+void runBuild(List targetList, String targetName) {
+    def target = targetList.find { it.name == targetName }
+    if (!target) error "Build target '${targetName}' not found"
+    bat target.run
+}
+
+// Run static code analysis
+void runStaticAnalysis(List targetList, String targetName) {
+    def target = targetList.find { it.name == targetName }
+    if (!target) error "Static analysis target '${targetName}' not found"
+    bat target.run
+}
+
+// Generate Cppcheck HTML report and publish it
+void runCppcheckReport() {
+    bat """
+        "py" "C:\\Program Files\\Cppcheck\\cppcheck-htmlreport" --file=cppcheck-report.xml --report-dir=cppcheck-report --source-dir=.
+    """
+    recordIssues tools: [[ $class: 'CppCheck', pattern: 'cppcheck-report.xml' ]]
+    publishHTML([reportDir: "cppcheck-report", reportFiles: 'index.html', reportName: 'Cppcheck Report'])
+}
+
+// Run unit tests based on configuration
+void runUnitTest(List targetList, String targetName) {
+    def target = targetList.find { it.name == targetName }
+    if (!target) error "Unit test target '${targetName}' not found"
+    bat target.run
+}
+
+// Check coverage result from YAML and ensure it's 100%
+void checkCoverage(String filePath) {
+    if (!fileExists(filePath)) return
+    def cov = readYaml file: filePath
+    if (cov.coverage != 100.0) {
+        error "Coverage is not 100%! Got ${cov.coverage}"
+    }
+}
+
+// Check test log for any failed tests
+void checkTestLog(String filePath) {
+    if (!fileExists(filePath)) return
+    def result = readYaml file: filePath
+    if (result.tests) {
+        error "Test failed: ${result.num}, ${result.tests}"
+    }
+}
+
+// Merge pull request using curl and credentials
+void mergePullRequest() {
+    def prId = env.CHANGE_ID
+    def gitUrl = env.GIT_URL ?: scm.userRemoteConfigs[0].url
+    def firstPart = gitUrl.replaceAll('(/repo/.*)', '/')
+    def secondPart = gitUrl.replaceAll('.*?repo/', '')
+    def credId = projectConfig.credentialsId
+
+    withCredentials([usernamePassword(credentialsId: credId, usernameVariable: 'SCM_USER', passwordVariable: 'SCM_PASS')]) {
+        bat """
+            curl -s -u %SCM_USER%:%SCM_PASS% ^
+            -H "accept: */*" ^
+            -H "Content-Type: application/vnd.scmm-mergeCommand+json;v=2" ^
+            -d "{\"commitMessage\": \"Merge by Jenkins\", \"shouldDeleteSourceBranch\": false}" ^
+            ${firstPart}api/v2/merge/${secondPart}/${prId}?strategy=MERGE_COMMIT
+        """
+    }
+}
+
+// Zip the result folder and archive it in Jenkins
+void generateResultZip() {
+    def timestamp = new Date().format('yyyyMMdd-HHmm')
+    def zipName = "CI_${env.BRANCH_NAME}-${timestamp}.zip"
+    bat "powershell Compress-Archive -Path result\\ ${zipName} -Update"
+    echo "Result URL: ${env.JOB_URL}lastSuccessfulBuild/artifact/${zipName}"
+    archiveArtifacts zipName
+}
+
+// Send notification to Teams or other service
+void notifyResult() {
+    def status = currentBuild.result ?: 'SUCCESS'
+    def color = status == 'SUCCESS' ? '00FF00' : 'FF0000'
+    def title = status == 'SUCCESS' ? 'Build Succeeded' : "Build Failed at stage: ${stageName}"
+
+    writeFile file: 'payload.json', text: """{
+      "@type": "MessageCard",
+      "@context": "http://schema.org/extensions",
+      "summary": "${title}",
+      "themeColor": "${color}",
+      "title": "${title}: ${env.JOB_NAME}",
+      "text": "**Build number: ${env.BUILD_NUMBER}** <br>**URL: [${env.BUILD_URL}](${env.BUILD_URL})**"
+    }"""
+
+    bat """
+        curl -H "Content-Type: application/json" -d @payload.json "${setNoti}"
+    """
+
+    bat "if exist payload.json del payload.json"
+}

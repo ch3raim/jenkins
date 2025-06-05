@@ -1,0 +1,212 @@
+// === Jenkinsfile (Scripted Pipeline) ===
+
+// Declare global variables
+String setNoti = '' // Notification endpoint
+String stageName = '' // Current stage name
+String stageBuild = '' // Name of the build stage
+String stageAnaly = '' // Name of the static analysis stage
+String stageUtest = '' // Name of the unit test stage
+String buildAgent = 'Server-PC' // Default agent to run the pipeline
+boolean sourceBuild = false // Flag to indicate whether this build should proceed
+
+def userConfig // User configuration from YAML
+
+def projectConfig // Project-wide configuration from YAML
+
+def cliConfig // CLI command configuration from YAML
+
+// Initial pipeline setup logic moved directly into first node block for simplicity
+node(buildAgent) {
+    echo "${buildAgent}"
+
+    // === Init Stage ===
+    stage('Init') {
+        cleanWs() // Clean workspace
+        checkout scm // Checkout source code
+
+        // Set GIT_URL if not already set
+        if (!env.GIT_URL) {
+            env.GIT_URL = scm.userRemoteConfigs[0].url
+        }
+
+        // Read YAML configuration files
+        userConfig = readYaml file: "${env.WORKSPACE}\\jenkins\\user_config\\ci-config.yaml"
+        projectConfig = readYaml file: "${env.WORKSPACE}\\jenkins\\project_config\\project_config.yaml"
+        cliConfig = readYaml file: "${env.WORKSPACE}\\jenkins\\project_config\\runcommand.yaml"
+
+        // Override build agent if defined in user config
+        buildAgent = userConfig.buildAgent ?: buildAgent
+        echo "buildAgent : ${buildAgent}"
+        echo "projectConfig.agentList : ${projectConfig.agentList}"
+
+        // Check if build agent is valid
+        if (!projectConfig.agentList.contains(buildAgent)) {
+            error "Invalid build agent: ${buildAgent}"
+        }
+    }
+}
+
+// === Main pipeline execution ===
+node(buildAgent) {
+    try {
+        echo "${buildAgent}"
+
+        // === Configuration Retrieval ===
+        stage('Get Config') {
+            // Extract stage names and notification settings
+            stageBuild = userConfig.buildSouce?.name
+            echo "stageBuild : ${stageBuild}"
+            stageAnaly = userConfig.analysis?.name
+            echo "stageAnaly : ${stageAnaly}"
+            stageUtest = userConfig.unitTest?.name
+            echo "stageUtest : ${stageUtest}"
+
+            def notiKey = userConfig.noti
+            setNoti = projectConfig[notiKey] ?: error("Notification channel '${notiKey}' not found.")
+            echo "setNoti : ${setNoti}"
+
+            // === Branch Validation ===
+            def mainOnly = userConfig.onlymain
+            if ((mainOnly == 'on' || mainOnly == true) && env.BRANCH_NAME != 'main') {
+                error("Build only allowed on main branch.")
+            }
+
+            // Determine if the build should proceed based on rules
+            def isPR = env.CHANGE_ID != null
+            def isCommit = !isPR
+            def buildRules = userConfig.buildRules ?: [userConfig.build]
+            if ((isPR && buildRules.contains('pr')) || (isCommit && buildRules.contains('commit'))) {
+                sourceBuild = true
+            } else {
+                error("Build rule does not allow this run.")
+            }
+            echo "sourceBuild = ${sourceBuild}"
+
+            // === Prepare workspace ===
+            bat """
+                if not exist ${env.WORKSPACE}\\result mkdir ${env.WORKSPACE}\\result
+                xcopy ${env.WORKSPACE}\\jenkins\\project_config\\runcommand\\* ${env.WORKSPACE}\\ /s /y
+            """
+        }
+
+        // === Build Stage ===
+        if (sourceBuild && stageBuild) {
+            stage('Build') {
+                def target = cliConfig.build.find { it.name == stageBuild }
+                if (!target) error "Build target '${stageBuild}' not found"
+                bat target.run // Run build command
+            }
+        }
+
+        // === Static Analysis Stage ===
+        if (sourceBuild && stageAnaly) {
+            stage('Static Analysis') {
+                def target = cliConfig.analysis.find { it.name == stageAnaly }
+                if (!target) error "Static analysis target '${stageAnaly}' not found"
+                bat target.run // Run static analysis
+            }
+
+            // Generate and publish Cppcheck report if selected
+            if (stageAnaly == 'cppcheck') {
+                stage('Generate Cppcheck Report') {
+                    bat """
+                        "py" "C:\\Program Files\\Cppcheck\\cppcheck-htmlreport" --file=cppcheck-report.xml --report-dir=cppcheck-report --source-dir=.
+                    """
+                    recordIssues tools: [[ $class: 'CppCheck', pattern: 'cppcheck-report.xml' ]]
+                    publishHTML([reportDir: "cppcheck-report", reportFiles: 'index.html', reportName: 'Cppcheck Report'])
+                }
+            }
+        }
+
+        // === Unit Testing and Results ===
+        if (sourceBuild && stageUtest) {
+            stage('Unit Test') {
+                def target = cliConfig.test.find { it.name == stageUtest }
+                if (!target) error "Unit test target '${stageUtest}' not found"
+                bat target.run // Run unit tests
+            }
+
+            // Check code coverage results
+            stage('Coverage Result') {
+                def filePath = "coverage_${stageUtest}.yaml"
+                if (fileExists(filePath)) {
+                    def cov = readYaml file: filePath
+                    if (cov.coverage != 100.0) {
+                        error "Coverage is not 100%! Got ${cov.coverage}"
+                    }
+                }
+            }
+
+            // Check unit test result logs
+            stage('Testlog Result') {
+                def filePath = "testlog_${stageUtest}.yaml"
+                if (fileExists(filePath)) {
+                    def result = readYaml file: filePath
+                    if (result.tests) {
+                        error "Test failed: ${result.num}, ${result.tests}"
+                    }
+                }
+            }
+        }
+
+        // === Pull Request Merge ===
+        if (env.CHANGE_ID) {
+            stage('Merge pull request') {
+                def prId = env.CHANGE_ID
+                def gitUrl = env.GIT_URL ?: scm.userRemoteConfigs[0].url
+                def firstPart = gitUrl.replaceAll('(/repo/.*)', '/')
+                def secondPart = gitUrl.replaceAll('.*?repo/', '')
+                def credId = projectConfig.credentialsId
+
+                // Use credentials to call API for PR merge
+                withCredentials([usernamePassword(credentialsId: credId, usernameVariable: 'SCM_USER', passwordVariable: 'SCM_PASS')]) {
+                    bat """
+                        curl -s -u %SCM_USER%:%SCM_PASS% ^
+                        -H "accept: */*" ^
+                        -H "Content-Type: application/vnd.scmm-mergeCommand+json;v=2" ^
+                        -d "{\"commitMessage\": \"Merge by Jenkins\", \"shouldDeleteSourceBranch\": false}" ^
+                        ${firstPart}api/v2/merge/${secondPart}/${prId}?strategy=MERGE_COMMIT
+                    """
+                }
+            }
+        }
+
+        // === Result Artifact ===
+        stage('Result URL') {
+            def timestamp = new Date().format('yyyyMMdd-HHmm')
+            def zipName = "CI_${env.BRANCH_NAME}-${timestamp}.zip"
+            bat "powershell Compress-Archive -Path result\\ ${zipName} -Update"
+            echo "Result URL: ${env.JOB_URL}lastSuccessfulBuild/artifact/${zipName}"
+            archiveArtifacts zipName // Archive the result zip
+        }
+
+    } catch (err) {
+        // === Error Handling ===
+        currentBuild.result = 'FAILURE'
+        echo "Error at stage : ${stageName}"
+        throw err
+    } finally {
+        // === Notification Result ===
+        def status = currentBuild.result ?: 'SUCCESS'
+        def color = status == 'SUCCESS' ? '00FF00' : 'FF0000'
+        def title = status == 'SUCCESS' ? 'Build Succeeded' : "Build Failed at stage: ${stageName}"
+
+        // Create notification payload
+        writeFile file: 'payload.json', text: """{
+          "@type": "MessageCard",
+          "@context": "http://schema.org/extensions",
+          "summary": "${title}",
+          "themeColor": "${color}",
+          "title": "${title}: ${env.JOB_NAME}",
+          "text": "**Build number: ${env.BUILD_NUMBER}** <br>**URL: [${env.BUILD_URL}](${env.BUILD_URL})**"
+        }"""
+
+        // Send notification
+        bat """
+            curl -H "Content-Type: application/json" -d @payload.json "${setNoti}"
+        """
+
+        // Clean up payload file
+        bat "if exist payload.json del payload.json"
+    }
+}
